@@ -35,3 +35,39 @@ pub fn norm_key(s: &str) -> String {
         .map(|c| c.to_ascii_lowercase())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 抽樣對照表項：避免逐項複製，只確認對照表確實生效。
+    #[test]
+    fn known_names_map_to_safe_aliases() {
+        assert_eq!(to_qwen_name("Read"), "fs_open_file");
+        assert_eq!(to_qwen_name("Bash"), "shell_run");
+        assert_eq!(to_qwen_name("WebFetch"), "http_get_url");
+    }
+
+    /// fallback：非映射表名一律 `u_` 前綴 + 非法字元替換為 `_`（含底線保留、空字串、unicode）。
+    #[test]
+    fn unknown_names_get_u_prefix_and_cleanup() {
+        // 純合法字元（含底線）→ 原樣
+        assert_eq!(to_qwen_name("my_tool"), "u_my_tool");
+        // `-`、`.`、空白 → `_`
+        assert_eq!(to_qwen_name("my-cool.tool 2"), "u_my_cool_tool_2");
+        // 空字串 → 只剩前綴
+        assert_eq!(to_qwen_name(""), "u_");
+        // 非 ASCII（中文）：chars().map() 一字一替 → 兩字 → 兩底線
+        assert_eq!(to_qwen_name("查詢"), "u___");
+    }
+
+    /// 反向匹配用：去掉非英數、轉小寫；非 ASCII 一律丟棄。
+    #[test]
+    fn norm_key_drops_punct_and_lowercases() {
+        assert_eq!(norm_key("Web-Fetch"), "webfetch");
+        assert_eq!(norm_key("  My_Tool_v2  "), "mytoolv2");
+        // 中文被 is_ascii_alphanumeric 過濾掉，只剩 abc
+        assert_eq!(norm_key("查詢abc"), "abc");
+        assert_eq!(norm_key(""), "");
+    }
+}

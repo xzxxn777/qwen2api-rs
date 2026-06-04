@@ -171,3 +171,145 @@ fn format_upstream_error(obj: &Value) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chunk_of(payload: serde_json::Value) -> String {
+        format!("data: {}\n\n", payload)
+    }
+
+    /// 空輸入、純 [DONE]、非 data: 行 → 一律不產 delta。
+    #[test]
+    fn empty_done_and_non_data_lines_yield_nothing() {
+        assert!(parse_sse_chunk("").is_empty());
+        assert!(parse_sse_chunk("data: [DONE]\n\n").is_empty());
+        assert!(parse_sse_chunk("data: \n\n").is_empty());
+        assert!(parse_sse_chunk("event: ping\n\n").is_empty());
+    }
+
+    /// 首事件 `response.created` 無 choices、或 choices 空、或缺 delta → 全跳過。
+    #[test]
+    fn payloads_without_choices_or_delta_are_skipped() {
+        let head = chunk_of(json!({ "response_id": "x", "object": "response.created" }));
+        let empty = chunk_of(json!({ "choices": [] }));
+        let no_delta = chunk_of(json!({ "choices": [{}] }));
+        assert!(parse_sse_chunk(&head).is_empty());
+        assert!(parse_sse_chunk(&empty).is_empty());
+        assert!(parse_sse_chunk(&no_delta).is_empty());
+    }
+
+    /// answer 階段：phase、content、status 直取；reasoning 兩欄皆空。
+    #[test]
+    fn answer_delta_extracts_phase_content_status() {
+        let c = chunk_of(json!({
+            "choices": [{ "delta": { "phase": "answer", "content": "hi", "status": "in_progress" } }]
+        }));
+        let v = parse_sse_chunk(&c);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].phase, "answer");
+        assert_eq!(v[0].content, "hi");
+        assert_eq!(v[0].status, "in_progress");
+        assert_eq!(v[0].reasoning_incremental, "");
+        assert!(v[0].reasoning_cumulative.is_none());
+    }
+
+    /// 舊格式 reasoning：reasoning_content / reasoning / thinking / extra.* 任一非空都會被抓。
+    #[test]
+    fn legacy_reasoning_keys_are_picked_up() {
+        let c = chunk_of(json!({
+            "choices": [{ "delta": { "phase": "think", "reasoning_content": "thought-a" } }]
+        }));
+        assert_eq!(parse_sse_chunk(&c)[0].reasoning_incremental, "thought-a");
+
+        // extra 內嵌的 thinking 也算
+        let c2 = chunk_of(json!({
+            "choices": [{ "delta": { "extra": { "thinking": "deep" } } }]
+        }));
+        assert_eq!(parse_sse_chunk(&c2)[0].reasoning_incremental, "deep");
+    }
+
+    /// qwen3.7 summary_thought：以 `\n\n` join 整個陣列 → reasoning_cumulative。
+    #[test]
+    fn qwen37_summary_thought_joins_with_double_newline() {
+        let c = chunk_of(json!({
+            "choices": [{ "delta": {
+                "extra": { "summary_thought": { "content": ["a", "b", "c"] } }
+            } }]
+        }));
+        assert_eq!(parse_sse_chunk(&c)[0].reasoning_cumulative.as_deref(), Some("a\n\nb\n\nc"));
+    }
+
+    /// summary_thought.content 為空陣列 → cumulative 為 None（避免送空字串）。
+    #[test]
+    fn empty_summary_thought_yields_none_cumulative() {
+        let c = chunk_of(json!({
+            "choices": [{ "delta": {
+                "extra": { "summary_thought": { "content": [] } }
+            } }]
+        }));
+        assert!(parse_sse_chunk(&c)[0].reasoning_cumulative.is_none());
+    }
+
+    /// 上游 usage 整塊原樣帶出。
+    #[test]
+    fn usage_field_passed_through() {
+        let c = chunk_of(json!({
+            "choices": [{ "delta": { "content": "" } }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 11 }
+        }));
+        let v = parse_sse_chunk(&c);
+        let usage = v[0].usage.as_ref().expect("usage 必有");
+        assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(usage.get("completion_tokens").and_then(|v| v.as_i64()), Some(11));
+    }
+
+    /// 同一 chunk 內多個 data: 行 → 各自成一個 QwenDelta。
+    #[test]
+    fn multi_data_lines_yield_multiple_deltas() {
+        let a = chunk_of(json!({ "choices": [{ "delta": { "content": "x" } }] }));
+        let b = chunk_of(json!({ "choices": [{ "delta": { "content": "y" } }] }));
+        let v = parse_sse_chunk(&format!("{a}{b}"));
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].content, "x");
+        assert_eq!(v[1].content, "y");
+    }
+
+    /// 損壞 JSON 不應中斷解析，只是跳過該行。
+    #[test]
+    fn malformed_json_is_skipped_not_panicking() {
+        let mixed = "data: {not json}\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+        let v = parse_sse_chunk(mixed);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].content, "ok");
+    }
+
+    /// 錯誤格式 1：`{"success":false, data:{code, details}}` → 格式化錯誤訊息含三者。
+    #[test]
+    fn extract_error_handles_success_false() {
+        let s = r#"data: {"success":false,"request_id":"req-1","data":{"code":"rate_limit","details":"too fast"}}"#;
+        let err = extract_upstream_error(s).expect("應偵測到錯誤");
+        assert!(err.contains("rate_limit"), "缺 code: {err}");
+        assert!(err.contains("req-1"), "缺 request_id: {err}");
+        assert!(err.contains("too fast"), "缺 details: {err}");
+    }
+
+    /// 錯誤格式 2：`{"error":{code, message}}` → 同樣格式化。
+    #[test]
+    fn extract_error_handles_error_object() {
+        let s = r#"data: {"error":{"code":"auth_error","message":"invalid token"}}"#;
+        let err = extract_upstream_error(s).expect("應偵測到錯誤");
+        assert!(err.contains("auth_error"));
+        assert!(err.contains("invalid token"));
+    }
+
+    /// 正常 SSE chunk 與 [DONE] 都不會被誤判為錯誤。
+    #[test]
+    fn extract_error_ignores_normal_payload() {
+        let s = r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
+        assert!(extract_upstream_error(s).is_none());
+        assert!(extract_upstream_error("data: [DONE]\n\n").is_none());
+    }
+}
