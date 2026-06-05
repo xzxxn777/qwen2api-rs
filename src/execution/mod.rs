@@ -318,23 +318,40 @@ pub fn run_completion(
             yielded_content_at_end = true;
         }
 
-        // 診斷：思考模型偶發「思考完客戶端啥都沒看到」。發生條件是：
-        // (a) 整輪結束無錯誤；(b) 沒串流出 content；(c) 終局沒一次性送 content；
-        // (d) 沒任何 tool_calls。warn log 把 phase 統計 + answer_buf 全文 + 解析後 cleaned 印出來，
-        // 用來判斷上游把答案送到了哪個 phase / parser 為什麼漏抓 tool_call。
+        // 診斷：thinking 模型偶發「思考完客戶端啥都沒看到」/「看到空 block + Brewed 等待」。
+        // 觸發條件分兩類：
+        //   (A) 完全零輸出：streamed_content=false && yielded_content_at_end=false && tool_calls 空
+        //   (B) 輸出極短（< 30 chars）但 has_tools=true：可能是 thinking 模型送幾乎全空白的 content，
+        //       client UI 顯示 text_block 開了但空白，配上「Brewed/Cogitated」等待 UI 體感像斷流
+        // 兩種都 dump phase 統計 + answer_buf + cleaned 內容（含可見字元化呈現）。
+        let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
+        let cleaned_chars = cleaned_full.chars().count();
         let client_saw_nothing = !streamed_content && !yielded_content_at_end && tool_calls.is_empty();
+        let suspicious_short = has_tools
+            && !client_saw_nothing
+            && tool_calls.is_empty()
+            && cleaned_chars > 0
+            && cleaned_chars < 30;
         if client_saw_nothing && has_tools {
-            let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
-            let cleaned_trim = cleaned_full.trim();
             tracing::warn!(
                 "[執行編排] 客戶端零輸出 phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_is_empty={} last_email={:?} out_tokens={} reasoning_tokens={} answer_buf_full={:?}",
                 answer_buf.chars().count(),
-                cleaned_full.chars().count(),
-                cleaned_trim.is_empty(),
+                cleaned_chars,
+                cleaned_full.trim().is_empty(),
                 last_email,
                 last_out_tokens,
                 last_reasoning_tokens,
                 answer_buf,
+            );
+        } else if suspicious_short {
+            tracing::warn!(
+                "[執行編排] 客戶端極短輸出（< 30 chars） phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_full={:?} last_email={:?} out_tokens={} reasoning_tokens={}",
+                answer_buf.chars().count(),
+                cleaned_chars,
+                cleaned_full,
+                last_email,
+                last_out_tokens,
+                last_reasoning_tokens,
             );
         }
 
