@@ -724,20 +724,20 @@ function renderAccounts() {
     el('div', { class: 'card-title' }, '手动注入账号'),
     el('div', { class: 'notice notice-warn' }, [
       el('span', { class: 'ico' }, '⚠️'),
-      el('span', null, '请先在 chat.qwen.ai 登录，F12 在 Application/本地存储 中找到 token 原始值直接粘贴，不要带 Bearer 前缀，不要从 Network 请求头提取。'),
+      el('span', null, '两种方式择一：(A) 贴 Token：F12 在 chat.qwen.ai 的 Application/本地存储中取得 token 原始值，不带 Bearer 前缀。(B) 仅填 Email + 密码：系统自动登入 chat.qwen.ai 取得 token（推荐）。'),
     ]),
     el('div', { class: 'field' }, [
-      el('label', null, 'Token（必填）'),
-      el('input', { class: 'input', id: 'injToken', placeholder: '粘贴 token 原始值' }),
+      el('label', null, 'Token（A 模式必填；B 模式留空）'),
+      el('input', { class: 'input', id: 'injToken', placeholder: '留空则用下方 Email + 密码自动登入' }),
     ]),
     el('div', { class: 'form-row' }, [
       el('div', { class: 'field' }, [
-        el('label', null, '邮箱（选填）'),
-        el('input', { class: 'input', id: 'injEmail', placeholder: '留空将自动生成' }),
+        el('label', null, '邮箱（B 模式必填）'),
+        el('input', { class: 'input', id: 'injEmail', placeholder: 'B 模式必填；A 模式留空将自动生成' }),
       ]),
       el('div', { class: 'field' }, [
-        el('label', null, '密码（选填）'),
-        el('input', { class: 'input', id: 'injPass', type: 'password', placeholder: '可选' }),
+        el('label', null, '密码（B 模式必填；A 模式可选，留作日后自动 refresh）'),
+        el('input', { class: 'input', id: 'injPass', type: 'password', placeholder: '强烈建议填写以支援自动 refresh' }),
       ]),
     ]),
     el('button', { class: 'btn btn-primary', id: 'btnInject', onclick: injectAccount }, '注入账号'),
@@ -919,9 +919,15 @@ function renderAccTable(host, accounts) {
 async function injectAccount() {
   const btn = document.getElementById('btnInject');
   const token = document.getElementById('injToken').value.trim();
+  const _email = document.getElementById('injEmail').value.trim();
+  const _pass = document.getElementById('injPass').value;
+  if (!token && !(_email && _pass)) {
+    toast('请填写 Token，或同时填写 Email + 密码以自动登入', 'error');
+    return;
+  }
   const email = document.getElementById('injEmail').value.trim();
   const password = document.getElementById('injPass').value;
-  if (!token) { toast('请填写 Token', 'error'); return; }
+
   btn.disabled = true; const old = btn.textContent; btn.textContent = '注入中…';
   const body = {
     email: email || `manual_${Date.now()}@qwen`,

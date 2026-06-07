@@ -112,21 +112,45 @@ pub async fn add_account(State(state): State<AppState>, headers: HeaderMap, body
         Ok(v) => v,
         Err(_) => return AppError::BadRequest("Invalid JSON body".into()).into_response(),
     };
-    let token = data.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if token.is_empty() {
-        return AppError::BadRequest("token is required".into()).into_response();
-    }
-    let email = data
-        .get("email")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("manual_{}@qwen", crate::util::now_millis()));
+    let mut token = data.get("token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let email_in = data.get("email").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let password = data.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let username = data.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let cookies = data.get("cookies").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // 注入前驗證 token
+    // 兩種注入模式擇一：
+    //   (A) 直接貼 token：email 選填（缺則自動生成 manual_*@qwen），系統 verify_token 後直接收。
+    //   (B) 只填 email + password：系統跑 chat.qwen.ai signin 自動拿 token。
+    // 至少需要 token，或 email+password。
+    if token.is_empty() {
+        if email_in.is_empty() || password.is_empty() {
+            return AppError::BadRequest(
+                "请填写 token，或同时填写 email + password 让系统自动登入".into(),
+            )
+            .into_response();
+        }
+        // 自動登入：跑 signin 拿 token
+        match state.client.signin(&email_in, &password).await {
+            Ok(t) => {
+                token = t;
+            }
+            Err(e) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": format!("自动登入失败：{e}"),
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    let email = if email_in.is_empty() {
+        format!("manual_{}@qwen", crate::util::now_millis())
+    } else {
+        email_in
+    };
+
+    // 注入前驗證 token（signin 剛拿到的也再 verify 一次，避免上游怪況）
     if !state.client.verify_token(&token).await {
         return Json(json!({ "ok": false, "error": "Invalid token (验证失败，请确认Token有效)" })).into_response();
     }
